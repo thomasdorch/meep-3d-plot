@@ -1,10 +1,12 @@
+from types import resolve_bases
 import meep as mp
 from meep import Vector3, Volume
+from meep.simulation import re
 from meep.visualization import box_vertices, filter_dict
 from typing import Optional, Union
 from collections import namedtuple
 from functools import partial
-import pyvista
+import pyvista as pv
 
 import numpy as np
 
@@ -63,23 +65,6 @@ def get_boundary_volumes(sim: mp.Simulation, boundary_thickness: float, directio
     else:
         raise ValueError("Invalid boundary type")
 
-def plot_volume3d(
-        plotter: pyvista.Plotter,
-        volume: Volume,
-        name: str = None,
-        **plot_parameters
-):
-    actor = None
-    if mp.am_master():
-        vol = pyvista.Cube(
-            center=[volume.center.x, volume.center.y, volume.center.z],
-            x_length=volume.size.x, y_length=volume.size.y, z_length=volume.size.z
-        )
-        params = filter_dict(plot_parameters, pyvista.Plotter.add_mesh)
-        if name is not None:
-            params["name"] = name
-        actor = plotter.add_mesh(vol, **params)
-    return plotter, actor
 
 
 default_eps_parameters_3d = {
@@ -137,17 +122,26 @@ translated_keys = {
     "colorbar": "show_scalar_bar"
 }
 
+def clean_dict(input_dict: Optional[dict], defaults_dict: dict):
+    # add default values if key not specified
+    if input_dict is None:
+        input_dict = defaults_dict 
+    else:
+        input_dict = dict(defaults_dict, **input_dict)
 
-def get_3d_ticks(vol: mp.Volume, resolution: int):
-    res = resolution
-    sim_size = vol.size
-    sim_center = vol.center
+    # replace keys if using plot2d key names
+    for key, trans in translated_keys.items():
+        if key in input_dict:
+           input_dict[trans] = input_dict.pop(key)
+    return input_dict
 
-    xmin, xmax, ymin, ymax, zmin, zmax = box_vertices(box_size=sim_size, box_center=sim_center)
 
-    Nx = int(sim_size.x * res)
-    Ny = int(sim_size.y * res)
-    Nz = int(sim_size.z * res)
+def get_3d_ticks(size: mp.Vector3, center: mp.Vector3, resolution: int):
+    xmin, xmax, ymin, ymax, zmin, zmax = box_vertices(box_size=size, box_center=center)
+
+    Nx = int(size.x * resolution)
+    Ny = int(size.y * resolution)
+    Nz = int(size.z * resolution)
 
     xtics = np.linspace(xmin, xmax, Nx)
     ytics = np.linspace(ymin, ymax, Ny)
@@ -155,25 +149,15 @@ def get_3d_ticks(vol: mp.Volume, resolution: int):
 
     return xtics, ytics, ztics
 
-def plot_eps_3d(
+def get_epsilon(
         sim: mp.Simulation,
-        eps_parameters: dict = None
-):
-    if eps_parameters is None:
-        eps_parameters = default_eps_parameters_3d
-    else:
-        eps_parameters = dict(default_eps_parameters_3d, **eps_parameters)
+        xticks: np.ndarray,
+        yticks: np.ndarray,
+        zticks: np.ndarray,
+        frequency: float,
+        ):
 
-    for key, trans in translated_keys.items():
-        if key in eps_parameters:
-            eps_parameters[trans] = eps_parameters.pop(key)
-
-    res = eps_parameters["resolution"] or sim.resolution
-    freq = eps_parameters["frequency"] or 0
-
-    xtics, ytics, ztics = get_3d_ticks(mp.Volume(center=sim.geometry_center, size=sim.cell_size), res)
-
-    return np.rot90(np.real(sim.get_epsilon_grid(xtics, ytics, ztics, frequency=freq)))
+    return np.rot90(np.real(sim.get_epsilon_grid(xtics, ytics, ztics, frequency=frequency)))
 
 
 def get_field_data(
@@ -208,7 +192,7 @@ def get_field_data(
     return field_data, field_parameters
 
 
-def plot_sources3d(sim: mp.Simulation, pl: pyvista.Plotter, source_parameters: dict = None):
+def plot_sources3d(sim: mp.Simulation, pl: pv.Plotter, source_parameters: dict = None):
     # consolidate plotting parameters
     if source_parameters is None:
         source_parameters = default_source_parameters_3d
@@ -222,7 +206,7 @@ def plot_sources3d(sim: mp.Simulation, pl: pyvista.Plotter, source_parameters: d
     return pl, actors
 
 
-def plot_monitors3d(sim: mp.Simulation, pl: pyvista.Plotter, monitor_parameters: dict = None):
+def plot_monitors3d(sim: mp.Simulation, pl: pv.Plotter, monitor_parameters: dict = None):
     # consolidate plotting parameters
     if monitor_parameters is None:
         monitor_parameters = default_monitor_parameters_3d
@@ -236,7 +220,7 @@ def plot_monitors3d(sim: mp.Simulation, pl: pyvista.Plotter, monitor_parameters:
             actors.append(actor)
     return pl, actors
 
-def plot_boundaries3d(sim: mp.Simulation, pl: pyvista.Plotter, boundary_parameters: dict = None):
+def plot_boundaries3d(sim: mp.Simulation, pl: pv.Plotter, boundary_parameters: dict = None):
     import itertools
 
     # consolidate plotting parameters
@@ -287,15 +271,6 @@ def plot_boundaries3d(sim: mp.Simulation, pl: pyvista.Plotter, boundary_paramete
             actors.append(actor)
     return pl, actors
 
-def setup_3d_view(plotter: pyvista.Plotter, camera_position: Union[str, tuple]) -> pyvista.Plotter:
-    plotter.add_axes()
-    plotter.show_bounds(
-        grid='front',
-        location='outer',
-        all_edges=True,
-    )
-    plotter.camera_position = camera_position
-    return plotter
 
 
 class SetVisibilityCallback:
@@ -308,90 +283,117 @@ class SetVisibilityCallback:
         for actor in self.actors:
             actor.SetVisibility(state)
 
+class Plot3D:
+    def __init__(
+            self,
+            sim: mp.Simulation,
+            field_component=None,
+            plotter: pv.Plotter = None,
+            initialized: bool = False,
+            eps_parameters: Optional[dict] = None,
+            boundary_parameters: Optional[dict] = None,
+            source_parameters: Optional[dict] = None,
+            monitor_parameters: Optional[dict] = None,
+            field_parameters: Optional[dict] = None,
+            plot_eps_flag: bool = True,
+            plot_sources_flag: bool = True,
+            plot_monitors_flag: bool = True,
+            plot_boundaries_flag: bool = True,
+            camera_position: Union[str, tuple] = "xz",
+            notebook: bool = False
+    ):
+        self.pl = plotter
 
-def plot3d(
-        sim: mp.Simulation,
-        field_component=None,
-        pl: pyvista.Plotter = None,
-        eps_parameters: Optional[dict] = None,
-        boundary_parameters: Optional[dict] = None,
-        source_parameters: Optional[dict] = None,
-        monitor_parameters: Optional[dict] = None,
-        field_parameters: Optional[dict] = None,
-        plot_eps_flag: bool = True,
-        plot_sources_flag: bool = True,
-        plot_monitors_flag: bool = True,
-        plot_boundaries_flag: bool = True,
-        camera_position: Union[str, tuple] = "xz",
-        shared_grid: Optional[pyvista.StructuredGrid] = None,
-        notebook: bool = False
-):
-    if pl is None and mp.am_master():
-        pl = pyvista.Plotter(notebook=notebook)
+        if self.pl is None and mp.am_master():
+            self.pl = pv.Plotter(notebook=notebook)
 
-    if shared_grid is None:
-        res = sim.resolution
-        vol = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
+            self.pl.add_axes()
+            self.pl.show_bounds(
+                grid='front',
+                location='outer',
+                all_edges=True,
+            )
+            self.pl.camera_position = camera_position
+        self.eps_parameters = clean_dict(eps_parameters, default_eps_parameters_3d)
 
-        shared_grid = pyvista.StructuredGrid(*np.meshgrid(*get_3d_ticks(vol=vol, resolution=sim.resolution)))
+        self.sim = sim
+        self.eps_resolution = sim.resolution
+        self.frequency = self.eps_parameters["frequency"] or 0
+        self.volume = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
 
-    xtics, ytics, ztics = get_3d_ticks(mp.Volume(center=sim.geometry_center, size=sim.cell_size), res)
+        self.xtics, self.ytics, self.ztics = get_3d_ticks(size=vol.size, center=vol.center, resolution=resolution)
 
-    widgets = {}
-    toggle_box_size = 50
-    toggle_x, toggle_y_start = 5.0, 12
-    actors = {}
-    meshes = {}
-    # Plot geometry
-    if plot_eps_flag:
-        if eps_parameters is None:
-            eps_parameters = default_eps_parameters_3d
-        else:
-            eps_parameters = dict(default_eps_parameters_3d, **eps_parameters)
+        self.xv, self.yv, self.zv = np.meshgrid(xtics, ytics, ztics)
+        
+        self.eps_grid = pv.StructuredGrid(xv, yv, zv)
+        self.field_grid = pv.StructuredGrid(xv, yv, zv)
 
-        for key, trans in translated_keys.items():
-            if key in eps_parameters:
-                eps_parameters[trans] = eps_parameters.pop(key)
+        self.toggle_box_size = 50
+        self.toggle_x, self.toggle_y_start = 5.0, 12
 
-        eps_data = np.rot90(np.real(sim.get_epsilon_grid(xtics, ytics, ztics)))
+        self.widgets = {}
+        self.actors = {}
+        self.meshes = {}
 
+    def plot_volume3d(self, volume: Volume, name: str, **plot_parameters):
         if mp.am_master():
-            eps_wrap = pyvista.wrap(eps_data)['values']
-            shared_grid['epsilon'] = eps_wrap
+            vol = pv.Cube(
+                center=[volume.center.x, volume.center.y, volume.center.z],
+                x_length=volume.size.x, y_length=volume.size.y, z_length=volume.size.z
+            )
+            self.actors[name] = self.pl.add_mesh(
+                    vol, 
+                    **filter_dict(plot_parameters, pv.Plotter.add_mesh)
+                    )
 
-            eps_parameters_all = filter_dict(eps_parameters, pyvista.Plotter.add_mesh)
-            eps_parameters_all.update(filter_dict(eps_parameters, pyvista.Plotter.add_mesh_threshold))
+    def plot_epsilon(self):
+        # Plot geometry
+        eps_data = np.rot90(np.real(sim.get_epsilon_grid(xtics, ytics, ztics, frequency)))
+        
+        if mp.am_master():
+            eps_mesh_values = pv.wrap(eps_data)["values"]
+            self.eps_grid["epsilon"] = eps_mesh_values
+
+            eps_parameters_all = filter_dict(self.eps_parameters, pv.Plotter.add_mesh)
+            # eps_parameters_all.update(filter_dict(eps_parameters, pv.Plotter.add_mesh_threshold))
             # shared_grid.contour(scalars='epsilon') if eps_parameters["contour"] else
-            eps_mesh = shared_grid
-            actors["eps"] = pl.add_mesh_threshold(
-                eps_mesh,
-                name="epsilon",
-                scalars="epsilon",
-                **eps_parameters_all
-            )
+            if self.actors["eps"] is None:
+                self.actors["eps"] = self.pl.add_mesh(
+                    self.eps_grid.contour(scalars="epsilon"),
+                    name="epsilon",
+                    **eps_parameters_all
+                )
+            else:
+                self.eps_grid
 
-            widgets["eps_toggle"] = pl.add_checkbox_button_widget(
-                SetVisibilityCallback([actors["eps"]]),
-                value=True,
-                position=(toggle_x, toggle_y_start),
-                border_size=1,
-                color_on="black",
-                color_off="grey",
-                background_color="grey"
-            )
+            self.widgets["eps_toggle"] = (
+                pl.add_checkbox_button_widget(
+                    SetVisibilityCallback([self.actors["eps"]]),
+                    value=True,
+                    position=(toggle_x, toggle_y_start),
+                    border_size=1,
+                    color_on="black",
+                    color_off="grey",
+                    background_color="grey"
+                ))
+            pl.add_text(
+                text="epsilon",
+                position=(toggle_x + toggle_box_size, toggle_y_start),
+                )
 
             toggle_y_start = toggle_y_start + toggle_box_size + (toggle_box_size // 10)
 
     # Plot boundaries
-    if plot_boundaries_flag:
+    def plot_boundaries(self):
         pl, bnd_actors = plot_boundaries3d(
             sim,
             pl=pl,
             boundary_parameters=boundary_parameters,
         )
         if mp.am_master():
-            widgets["boundaries"] = bnd_actors
-            widgets["boundary_toggle"] = pl.add_checkbox_button_widget(
+            # widgets["boundaries"] = bnd_actors
+            # widgets["boundary_toggle"] =
+            pl.add_checkbox_button_widget(
                 SetVisibilityCallback(bnd_actors),
                 value=True,
                 position=(toggle_x, toggle_y_start),
@@ -400,17 +402,22 @@ def plot3d(
                 color_off="grey",
                 background_color="grey"
             )
+            pl.add_text(
+                text="boundaries",
+                position=(toggle_x + toggle_box_size, toggle_y_start),
+                )
         toggle_y_start = toggle_y_start + toggle_box_size + (toggle_box_size // 10)
     # Plot sources
-    if plot_sources_flag:
+    def plot_sources(self):
         pl, src_actors = plot_sources3d(
             sim,
             pl=pl,
             source_parameters=source_parameters,
         )
         if mp.am_master():
-            widgets["sources"] = src_actors
-            widgets["source_toggle"] = pl.add_checkbox_button_widget(
+            # widgets["sources"] = src_actors
+#             widgets["source_toggle"] = 
+            pl.add_checkbox_button_widget(
                 SetVisibilityCallback(src_actors),
                 value=True,
                 position=(toggle_x, toggle_y_start),
@@ -419,18 +426,24 @@ def plot3d(
                 color_off="grey",
                 background_color="grey"
             )
+            pl.add_text(
+                text="sources",
+                position=(toggle_x + toggle_box_size, toggle_y_start),
+                )
+
         toggle_y_start = toggle_y_start + toggle_box_size + (toggle_box_size // 10)
 
     # Plot monitors
-    if plot_monitors_flag:
+    def plot_monitors(self):
         pl, mon_actors = plot_monitors3d(
             sim,
             pl=pl,
             monitor_parameters=monitor_parameters,
         )
         if mp.am_master():
-            widgets["monitors"] = mon_actors
-            widgets["monitor_toggle"] = pl.add_checkbox_button_widget(
+            # widgets["monitors"] = mon_actors
+            # widgets["monitor_toggle"] = 
+            pl.add_checkbox_button_widget(
                 SetVisibilityCallback(mon_actors),
                 value=True,
                 position=(toggle_x, toggle_y_start),
@@ -439,30 +452,19 @@ def plot3d(
                 color_off="grey",
                 background_color="grey"
             )
+            pl.add_text(
+                text="monitors",
+                position=(toggle_x + toggle_box_size, toggle_y_start),
+                )
+
         toggle_y_start = toggle_y_start + toggle_box_size + (toggle_box_size // 10)
 
     # Plot fields
-    if field_component is not None:
-        # pl, field_actor = plot_field3d(
-        #     sim,
-        #     field_component,
-        #     grid=shared_grid,
-        #     pl=pl,
-        #     field_parameters=field_parameters,
-        # )
+    def plot_field_component(self):
         if not sim._is_initialized:
             sim.init_sim()
 
-        if field_parameters is None:
-            field_parameters = default_field_parameters_3d
-        else:
-            field_parameters = dict(default_field_parameters_3d, **field_parameters)
-
-        for key, trans in translated_keys.items():
-            if key in field_parameters:
-                field_parameters[trans] = field_parameters.pop(key)
-
-        vol = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
+        field_parameters = clean_dict(field_parameters, default_field_parameters_3d)
 
         field_data = sim.get_array(vol=vol, component=field_component)
 
@@ -474,18 +476,20 @@ def plot3d(
             field_data = np.rot90(field_data)
 
         if mp.am_master():
-            wrap = pyvista.wrap(field_data)["values"]
-            shared_grid["field"] = wrap
+            field_grid = pv.StructuredGrid(xv, yv, zv)
+
+            field_mesh_values = pv.wrap(field_data)["values"]
+            field_grid["field"] = field_mesh_values
 
             field_actor = pl.add_mesh(
-                shared_grid.contour(scalars="field"),
+                field_grid.contour(),
                 name="field",
-                scalars="field",
-                **filter_dict(field_parameters, pyvista.Plotter.add_mesh)
+                **filter_dict(field_parameters, pv.Plotter.add_mesh)
             )
 
-            widgets["field_plot"] = field_actor
-            widgets["field_toggle"] = pl.add_checkbox_button_widget(
+            # widgets["field_plot"] = field_actor
+            # widgets["field_toggle"] =
+            pl.add_checkbox_button_widget(
                 SetVisibilityCallback([field_actor]),
                 value=True,
                 position=(toggle_x, toggle_y_start),
@@ -494,11 +498,11 @@ def plot3d(
                 color_off="grey",
                 background_color="grey"
             )
-
-    if mp.am_master():
-        pl = setup_3d_view(plotter=pl, camera_position=camera_position)
-    return pl, actors, widgets
-
+            pl.add_text(
+                text="fields",
+                position=(toggle_x + toggle_box_size, toggle_y_start),
+                )
+       
 # import mpi4py
 class Animate3D:
     def __init__(
@@ -522,22 +526,24 @@ class Animate3D:
 
         self.init = False
 
-        vol = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
-        xtics, ytics, ztics, = get_3d_ticks(vol=vol, resolution=sim.resolution)
-
-        self.shared_grid = pyvista.StructuredGrid(*np.meshgrid(xtics, ytics, ztics))
-
         _movie_plotter = None
         plotter = None
+        
+        self.actors = {}
+        self._movie_actors = {}
+        
+        self.widgets = {}
+        self._movie_widgets = {}
+
 
         if mp.am_master():
-            plotter = pyvista.Plotter(off_screen=False, line_smoothing=True, notebook=notebook)
+            plotter = pv.Plotter(off_screen=False, line_smoothing=True, notebook=notebook)
 
             if aspect:
                 plotter.window_size = [int(1080 * aspect), int(1080 * (1 / aspect))]
 
             if save_file is not None:
-                _movie_plotter = pyvista.Plotter(off_screen=True, notebook=notebook, line_smoothing=True)
+                _movie_plotter = pv.Plotter(off_screen=True, notebook=notebook, line_smoothing=True)
                 if aspect:
                     _movie_plotter.window_size = [int(2160 * aspect), int(2160 * (1 / aspect))]
 
@@ -551,19 +557,24 @@ class Animate3D:
     def __call__(self, sim: mp.Simulation, todo: str) -> None:
         if todo == "step":
             extra_args = self.filtered_args.copy()
-            if self.init:
-                extra_args.update(
-                    {
-                        "plot_eps_flag": self.update_eps,
-                        "plot_sources_flag": False,
-                        "plot_monitors_flag": False,
-                        "plot_boundaries_flag": False,
-                    }
-                )
+            # if self.init:
+            #     extra_args.update(
+            #         {
+            #             "plot_eps_flag": self.update_eps,
+            #             "plot_sources_flag": False,
+            #             "plot_monitors_flag": False,
+            #             "plot_boundaries_flag": False,
+            #         }
+            #     )
+            if mp.am_master():
+                for actor in self.plotter.pickable_actors:
+                   self.plotter.remove_actor(actor)   
+                # self.plotter.clear_button_widgets()
+                # self.plotter.clear_slider_widgets()
+
             plotter, actors, widgets = plot3d(
                 sim=sim,
                 field_component=self.field_component,
-                shared_grid=self.shared_grid,
                 pl=self.plotter,
                 **extra_args
             )
@@ -571,7 +582,6 @@ class Animate3D:
                 _movie_plotter, _movie_actors, _movie_widgets = plot3d(
                     sim=sim,
                     field_component=self.field_component,
-                    shared_grid=self.shared_grid,
                     pl=self._movie_plotter,
                     **extra_args
                 )
@@ -629,23 +639,22 @@ if __name__ == "__main__":
         boundary_layers=[mp.PML(thickness=1.0, direction=mp.ALL)]
     )
     sim.add_flux(f, 0.1, 10, mon)
-
-    pl, ac, ws = plot3d(
-        sim,
-        field_parameters={"post_process": lambda x: np.abs(x)**2},
-        plot_boundaries_flag=False
-    )
-
-    if mp.am_master():
-        pl.show()
-
-    # anim = Animate3D(
-    #     field_component=mp.Ey,
+    #
+    # pl, ac, ws = plot3d(
+    #     sim,
     #     field_parameters={"post_process": lambda x: np.abs(x)**2},
     #     plot_boundaries_flag=False
     # )
     #
-    # sim.run(mp.at_every(0.15, anim), until=1)
-    #
     # if mp.am_master():
-    #     anim.plotter.show()
+    #     pl.show()
+    anim = Animate3D(
+        field_component=mp.Ey,
+        field_parameters={"post_process": lambda x: np.abs(x)**2},
+        # plot_boundaries_flag=False
+    )
+
+    sim.run(mp.at_every(0.15, anim), until=1)
+
+    if mp.am_master():
+        anim.plotter.show()
