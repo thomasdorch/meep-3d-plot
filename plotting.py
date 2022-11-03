@@ -149,22 +149,24 @@ def get_3d_ticks(size: mp.Vector3, center: mp.Vector3, resolution: int):
 
     return xtics, ytics, ztics
 
-class SetVisibilityCallback:
-    """Helper callback to keep a reference to the actor being modified."""
-
-    def __init__(self, actors):
-        self.actors = actors
-
-    def __call__(self, state):
-        for actor in self.actors:
-            actor.SetVisibility(state)
+# class SetVisibilityCallback:
+#     """Helper callback to keep a reference to the actor being modified."""
+#
+#     def __init__(self, actors):
+#         self.actors = actors
+#
+#     def __call__(self, state):
+#         for actor in self.actors:
+#             actor.SetVisibility(state)
 
 class Plot3D:
     def __init__(
             self,
             sim: mp.Simulation,
             field_component=None,
-            plotter: pv.Plotter = None,
+            plotter: Optional[pv.Plotter] = None,
+            close_when_finished: bool = False,
+            update_epsilon: bool = False,
             eps_parameters: Optional[dict] = None,
             boundary_parameters: Optional[dict] = None,
             source_parameters: Optional[dict] = None,
@@ -175,12 +177,19 @@ class Plot3D:
             plot_monitors_flag: bool = True,
             plot_boundaries_flag: bool = True,
             camera_position: Union[str, tuple] = "xz",
-            notebook: bool = False
+            notebook: bool = False,
+            **plotter_kwargs
     ):
+        self.close_when_finished = close_when_finished
         self.pl = plotter
 
         if self.pl is None and mp.am_master():
-            self.pl = pv.Plotter(notebook=notebook)
+            self.pl = pv.Plotter(
+                off_screen=False,
+                line_smoothing=True,
+                notebook=notebook,
+                **filter_dict(plotter_kwargs, pv.Plotter.__init__)
+            )
 
             self.pl.add_axes()
             self.pl.show_bounds(
@@ -190,6 +199,7 @@ class Plot3D:
             )
             self.pl.camera_position = camera_position
 
+        self.update_epsilon = update_epsilon
         self.field_component = field_component
 
         self.eps_parameters = clean_dict(eps_parameters, default_eps_parameters_3d)
@@ -204,22 +214,37 @@ class Plot3D:
         self.resolution = sim.resolution
         self.volume = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
 
-        self.xtics, self.ytics, self.ztics = get_3d_ticks(size=self.volume.size, center=self.volume.center, resolution=self.resolution)
+        self.xtics, self.ytics, self.ztics = get_3d_ticks(
+            size=self.volume.size, center=self.volume.center, resolution=self.resolution
+        )
 
         xv, yv, zv = np.meshgrid(self.xtics, self.ytics, self.ztics)
         
         self.eps_grid = pv.StructuredGrid(xv, yv, zv)
         self.field_grid = pv.StructuredGrid(xv, yv, zv)
 
-        self.toggle_box_size = 50
+        self.field_actor = None
+        self.eps_actor = None
+
+        self.font_size = 10
+
+        self.toggle_box_size = 30
         self.toggle_x, self.toggle_y_start = 5.0, 12
+        self.toggle_text_offset_x = self.toggle_x + self.toggle_box_size + 5
+        self.toggle_text_offset_y = 5
 
-        self.widgets = {}
-        self.actors = {}
-        self.meshes = {}
+        self.toggle_boxes = {}
+        self.text_actors = {}
+        self.mesh_actors = {}
 
-    def plot(self, show: bool = False):
-        self.plot_epsilon()
+        # Needed for step functions
+        self.__code__ = namedtuple("gna_hack", ["co_argcount"])
+        self.__code__.co_argcount = 2
+
+    def _plot_all(self):
+        if self.eps_actor is None or self.update_epsilon:
+            self.plot_epsilon()
+
         self.plot_sources()
         self.plot_monitors()
         self.plot_boundaries()
@@ -227,25 +252,67 @@ class Plot3D:
         if self.field_component:
             self.plot_field_component()
 
+    def plot(self, show: bool = False):
+        self._plot_all()
+
         if mp.am_master() and show:
             self.pl.show()
+
+    def __call__(self, sim: mp.Simulation, todo: str) -> None:
+        if todo == "step":
+            self._plot_all()
+
+            if mp.am_master():
+                self.pl.show(interactive_update=True)
+
+        elif todo == "finish":
+            if mp.am_master():
+                if self.close_when_finished:
+                    self.pl.close()
+
+    # These all need to get the actor dynamically
+    def toggle_epsilon(self, state):
+        self.eps_actor.SetVisibility(state)
+
+    def toggle_fields(self, state):
+        self.field_actor.SetVisibility(state)
+
+    def toggle_sources(self, state):
+        for actor in [actor for name, actor in self.mesh_actors.items() if "source-" in name]:
+            actor.SetVisibility(state)
+
+    def toggle_monitors(self, state):
+        for actor in [actor for name, actor in self.mesh_actors.items() if "monitor-" in name]:
+            actor.SetVisibility(state)
+
+    def toggle_boundaries(self, state):
+        for actor in [actor for name, actor in self.mesh_actors.items() if "boundary-" in name]:
+            actor.SetVisibility(state)
 
     def increment_checkbox_pos(self):
         self.toggle_y_start = self.toggle_y_start + self.toggle_box_size + (self.toggle_box_size // 10)
 
     def add_toggle_box_text(self, text: str):
-        self.pl.add_text(
+        if text in self.text_actors.keys():
+            print(f"Actor for {text} being recreated!")
+            self.pl.remove_actor(self.text_actors.pop(text))
+        self.text_actors[text] = self.pl.add_text(
             text=text,
-            position=(self.toggle_x + self.toggle_box_size, self.toggle_y_start),
+            position=(self.toggle_text_offset_x, self.toggle_y_start + self.toggle_text_offset_y),
+            font_size=self.font_size
         )
 
     def plot_volume3d(self, volume: Volume, name: str, **plot_parameters):
         if mp.am_master():
+            if name in self.text_actors.keys():
+                print(f"Actor for {name} being recreated!")
+                self.pl.remove_actor(self.text_actors.pop(name))
+
             vol = pv.Cube(
                 center=[volume.center.x, volume.center.y, volume.center.z],
                 x_length=volume.size.x, y_length=volume.size.y, z_length=volume.size.z
             )
-            self.actors[name] = self.pl.add_mesh(
+            self.mesh_actors[name] = self.pl.add_mesh(
                     vol, 
                     **filter_dict(plot_parameters, pv.Plotter.add_mesh)
                     )
@@ -256,25 +323,25 @@ class Plot3D:
             np.real(
                 sim.get_epsilon_grid(self.xtics, self.ytics, self.ztics, self.frequency)
             )
-        )
+        ).flatten(order='F')
         if mp.am_master():
-            self.eps_grid["epsilon"] = eps_data.flatten(order='F')
+            self.eps_grid["epsilon"] = eps_data
 
-            if "eps" in self.actors.keys():
-                self.pl.update_scalars(self.eps_grid["epsilon"], mesh=self.eps_grid)
-            else:
-                eps_parameters_all = filter_dict(self.eps_parameters, pv.Plotter.add_mesh)
-                eps_parameters_all.update(filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
+            print("Updating epsilon data...")
+            eps_parameters_all = filter_dict(self.eps_parameters, pv.Plotter.add_mesh)
+            eps_parameters_all.update(filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
 
-                self.actors["eps"] = self.pl.add_mesh_threshold(
-                    self.eps_grid.contour(scalars="epsilon") if self.eps_parameters["contour"] else self.eps_grid,
-                    name="epsilon",
-                    **eps_parameters_all
-                )
+            self.eps_actor = self.pl.add_mesh_threshold(
+                self.eps_grid.contour() if self.eps_parameters["contour"] else self.eps_grid,
+                name="epsilon",
+                **eps_parameters_all
+            )
 
-                self.widgets["eps_toggle"] = (
+            if "epsilon" not in self.toggle_boxes:
+                self.toggle_boxes["epsilon"] = (
                     self.pl.add_checkbox_button_widget(
-                        SetVisibilityCallback([self.actors["eps"]]),
+                        self.toggle_epsilon,
+                        size=self.toggle_box_size,
                         value=True,
                         position=(self.toggle_x, self.toggle_y_start),
                         border_size=1,
@@ -283,56 +350,7 @@ class Plot3D:
                         background_color="grey"
                     ))
                 self.add_toggle_box_text(text="epsilon")
-            self.increment_checkbox_pos()
-
-    # Plot sources
-    def plot_sources(self):
-        if mp.am_master() and "source_toggle" in self.actors.keys():
-            return
-
-        for i, src in enumerate(sim.sources):
-            vol = Volume(center=src.center, size=src.size)
-            self.plot_volume3d(volume=vol, name=f"source-{i}", **self.source_parameters)
-
-        if mp.am_master():
-            self.widgets["source_toggle"] = (
-                self.pl.add_checkbox_button_widget(
-                    SetVisibilityCallback([actor for name, actor in self.actors.items() if "source-" in name]),
-                    value=True,
-                    position=(self.toggle_x, self.toggle_y_start),
-                    border_size=1,
-                    color_on="r",
-                    color_off="grey",
-                    background_color="grey"
-                )
-            )
-            self.add_toggle_box_text(text="source")
-        self.increment_checkbox_pos()
-
-    # Plot monitors
-    def plot_monitors(self):
-        if mp.am_master() and "monitor_toggle" in self.actors.keys():
-            return
-
-        for i, mon in enumerate(sim.dft_objects):
-            for j, reg in enumerate(mon.regions):
-                vol = Volume(center=reg.center, size=reg.size)
-                self.plot_volume3d(volume=vol, name=f"monitor-{i},{j}", **self.monitor_parameters)
-
-        if mp.am_master():
-            self.widgets["monitor_toggle"] = (
-                self.pl.add_checkbox_button_widget(
-                    SetVisibilityCallback([actor for name, actor in self.actors.items() if "monitor-" in name]),
-                    value=True,
-                    position=(self.toggle_x, self.toggle_y_start),
-                    border_size=1,
-                    color_on="b",
-                    color_off="grey",
-                    background_color="grey"
-                )
-            )
-            self.add_toggle_box_text(text="monitor")
-        self.increment_checkbox_pos()
+                self.increment_checkbox_pos()
 
     # Plot fields
     def plot_field_component(self):
@@ -346,24 +364,24 @@ class Plot3D:
             field_data = np.flipud(field_data)
         else:
             field_data = np.rot90(field_data)
+        field_data = field_data.flatten(order='F')
 
         if mp.am_master():
-            field_mesh_values = field_data.flatten(order='F') # pv.wrap(field_data)["values"]
-            self.field_grid["field"] = field_mesh_values
+            self.field_grid["field"] = field_data
 
-            if "field" in self.widgets.keys():
-                self.pl.update_scalars(field_mesh_values, mesh=self.field_grid)
-            else:
-                field_actor = self.pl.add_mesh(
-                    self.field_grid.contour(),
-                    name="field",
-                    **filter_dict(self.field_parameters, pv.Plotter.add_mesh)
-                )
+            print("Updating field data...")
 
-                self.widgets["field"] = field_actor
-                self.widgets["field_toggle"] = (
+            self.field_actor = self.pl.add_mesh(
+                # Add option to draw glyphs
+                self.field_grid.contour(),
+                name="field",
+                **filter_dict(self.field_parameters, pv.Plotter.add_mesh)
+            )
+            if "field" not in self.toggle_boxes:
+                self.toggle_boxes["field"] = (
                     self.pl.add_checkbox_button_widget(
-                        SetVisibilityCallback([field_actor]),
+                        self.toggle_fields,
+                        size=self.toggle_box_size,
                         value=True,
                         position=(self.toggle_x, self.toggle_y_start),
                         border_size=1,
@@ -372,14 +390,64 @@ class Plot3D:
                         background_color="grey"
                     )
                 )
-                self.pl.add_text(
-                    text="fields",
-                    position=(self.toggle_x + self.toggle_box_size, self.toggle_y_start),
-                    )
+                self.add_toggle_box_text(text="field")
+                self.increment_checkbox_pos()
+
+    # Plot sources
+    def plot_sources(self):
+        # Don't redraw
+        if mp.am_master() and "sources" in self.toggle_boxes.keys():
+            return
+
+        for i, src in enumerate(sim.sources):
+            vol = Volume(center=src.center, size=src.size)
+            self.plot_volume3d(volume=vol, name=f"source-{i}", **self.source_parameters)
+
+        if mp.am_master():
+            self.toggle_boxes["sources"] = (
+                self.pl.add_checkbox_button_widget(
+                    self.toggle_sources,
+                    size=self.toggle_box_size,
+                    value=True,
+                    position=(self.toggle_x, self.toggle_y_start),
+                    border_size=1,
+                    color_on="r",
+                    color_off="grey",
+                    background_color="grey"
+                )
+            )
+            self.add_toggle_box_text(text="source")
+        self.increment_checkbox_pos()
+
+    # Plot monitors
+    def plot_monitors(self):
+        if mp.am_master() and "monitors" in self.toggle_boxes.keys():
+            return
+
+        for i, mon in enumerate(sim.dft_objects):
+            for j, reg in enumerate(mon.regions):
+                vol = Volume(center=reg.center, size=reg.size)
+                self.plot_volume3d(volume=vol, name=f"monitor-{i},{j}", **self.monitor_parameters)
+
+        if mp.am_master():
+            self.toggle_boxes["monitors"] = (
+                self.pl.add_checkbox_button_widget(
+                    self.toggle_monitors,
+                    size=self.toggle_box_size,
+                    value=True,
+                    position=(self.toggle_x, self.toggle_y_start),
+                    border_size=1,
+                    color_on="b",
+                    color_off="grey",
+                    background_color="grey"
+                )
+            )
+            self.add_toggle_box_text(text="monitor")
         self.increment_checkbox_pos()
 
     def plot_boundaries(self):
-        if "boundary_toggle" in self.actors.keys():
+        # Don't redraw boundaries
+        if "boundaries" in self.toggle_boxes.keys():
             return
 
         import itertools
@@ -431,9 +499,10 @@ class Plot3D:
                 )
 
         if mp.am_master():
-            self.widgets["boundary_toggle"] = (
+            self.toggle_boxes["boundaries"] = (
                 self.pl.add_checkbox_button_widget(
-                    SetVisibilityCallback([actor for name, actor in self.actors.items() if "boundary-" in name]),
+                    self.toggle_boundaries,
+                    size=self.toggle_box_size,
                     value=True,
                     position=(self.toggle_x, self.toggle_y_start),
                     border_size=1,
@@ -460,8 +529,7 @@ class Animate3D:
 
         self.field_component = field_component
         self.update_eps = update_eps
-        self.customization_args = customization_args
-        self.filtered_args = filter_dict(self.customization_args, plot3d)
+
 
         self.save_file = save_file
         self.camera_position = camera_position
@@ -470,7 +538,7 @@ class Animate3D:
 
         _movie_plotter = None
         plotter = None
-        
+
         self.actors = {}
         self._movie_actors = {}
         
@@ -572,8 +640,8 @@ if __name__ == "__main__":
     )
     sim.add_flux(f, 0.1, 10, mon)
 
-    plotter = Plot3D(sim)
-    plotter.plot(True)
+    plotter = Plot3D(sim, field_component=mp.Ey)
+
     #
     # pl, ac, ws = plot3d(
     #     sim,
@@ -589,7 +657,6 @@ if __name__ == "__main__":
     #     # plot_boundaries_flag=False
     # )
     #
-    # sim.run(mp.at_every(0.15, anim), until=1)
-    #
-    # if mp.am_master():
-    #     anim.plotter.show()
+    sim.run(mp.at_every(0.15, plotter), until=1)
+
+    plotter.plot(show=True)
