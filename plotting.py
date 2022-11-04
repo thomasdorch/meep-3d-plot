@@ -245,11 +245,12 @@ class Plot3D:
 
     def _plot_all(self):
         if self.eps_actor is None or self.update_epsilon:
-            eps_data=np.rot90(
+            eps_data = np.rot90(
                 np.real(
                     self.sim.get_epsilon_grid(self.xtics, self.ytics, self.ztics, self.frequency)
                     )
                 ).flatten(order='F')
+
             if mp.am_master():
                 self.plot_epsilon(eps_data)
 
@@ -262,7 +263,15 @@ class Plot3D:
             if not self.sim._is_initialized:
                 print("initializing sim...")
                 self.sim.init_sim()
+
             field_data = self.sim.get_array(vol=self.volume, component=self.field_component)
+            field_data = self.field_parameters["post_process"](field_data)
+
+            if (self.sim.dimensions == mp.CYLINDRICAL) or self.sim.is_cylindrical:
+                field_data = np.flipud(field_data)
+            else:
+                field_data = np.rot90(field_data)
+            field_data = field_data.flatten(order='F')
 
             if mp.am_master():
                 self.plot_field_component(field_data)
@@ -327,58 +336,47 @@ class Plot3D:
 
     def plot_epsilon(self, eps_data: np.ndarray):
         # Plot geometry
-        
-        if mp.am_master():
-            print("Updating epsilon data...")
+        print("Updating epsilon data...")
 
-            self.grid["epsilon"] = eps_data
+        self.grid["epsilon"] = eps_data
 
-            eps_parameters_all = filter_dict(self.eps_parameters, pv.Plotter.add_mesh)
-            eps_parameters_all.update(filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
+        eps_parameters_all = filter_dict(self.eps_parameters, pv.Plotter.add_mesh)
+        eps_parameters_all.update(filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
 
-            if self.eps_parameters["contour"]:
-                self.eps_actor = self.pl.add_mesh(
-                    self.grid.contour(scalars="epsilon", compute_normals=True, progress_bar=True),
-                    # self.grid.ex
-                    name="epsilon",
-                    **eps_parameters_all
-                    )
-            else:
-                self.eps_actor = self.pl.add_mesh_threshold(
-                    self.grid,
-                    name="epsilon",
-                    scalars="epsilon",
-                    **eps_parameters_all
-                    )
+        if self.eps_parameters["contour"]:
+            self.eps_actor = self.pl.add_mesh(
+                self.grid.contour(scalars="epsilon", compute_normals=True, progress_bar=True),
+                name="epsilon",
+                **eps_parameters_all
+                )
+        else:
+            self.eps_actor = self.pl.add_mesh_threshold(
+                self.grid,
+                name="epsilon",
+                scalars="epsilon",
+                **eps_parameters_all
+                )
 
-            if "epsilon" not in self.toggle_boxes:
-                self.toggle_boxes["epsilon"] = (
-                    self.pl.add_checkbox_button_widget(
-                        self.toggle_epsilon,
-                        size=self.toggle_box_size,
-                        value=True,
-                        position=(self.toggle_x, self.toggle_y_start),
-                        border_size=1,
-                        color_on="black",
-                        color_off="grey",
-                        background_color="grey"
-                    ))
-                self.add_toggle_box_text(text="epsilon")
-                self.increment_checkbox_pos()
+        if "epsilon" not in self.toggle_boxes:
+            self.toggle_boxes["epsilon"] = (
+                self.pl.add_checkbox_button_widget(
+                    self.toggle_epsilon,
+                    size=self.toggle_box_size,
+                    value=True,
+                    position=(self.toggle_x, self.toggle_y_start),
+                    border_size=1,
+                    color_on="black",
+                    color_off="grey",
+                    background_color="grey"
+                ))
+            self.add_toggle_box_text(text="epsilon")
+            self.increment_checkbox_pos()
 
     # Plot fields
     def plot_field_component(self, field_data: np.ndarray):
-        field_data = self.field_parameters["post_process"](field_data)
-
-        if (self.sim.dimensions == mp.CYLINDRICAL) or self.sim.is_cylindrical:
-            field_data = np.flipud(field_data)
-        else:
-            field_data = np.rot90(field_data)
-        field_data = field_data.flatten(order='F')
+        print("Updating field data...")
 
         self.grid["field"] = field_data
-
-        print("Updating field data...")
 
         self.field_actor = self.pl.add_mesh(
             # Add option to draw glyphs
@@ -657,7 +655,7 @@ if __name__ == "__main__":
     )
     sim.add_flux(f, 0.1, 10, mon)
 
-    plotter = Plot3D(sim, field_component=mp.Ey)
+    plotter = Plot3D(sim)
 
     #
     # pl, ac, ws = plot3d(
