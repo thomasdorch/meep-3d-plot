@@ -220,11 +220,13 @@ class Plot3D:
 
         xv, yv, zv = np.meshgrid(self.xtics, self.ytics, self.ztics)
         
-        self.eps_grid = pv.StructuredGrid(xv, yv, zv)
-        self.field_grid = pv.StructuredGrid(xv, yv, zv)
+        self.grid = pv.StructuredGrid(xv, yv, zv) if mp.am_master() else None
 
         self.field_actor = None
         self.eps_actor = None
+        self.boundary_actors = []
+        self.source_actors = []
+        self.monitor_actors = []
 
         self.font_size = 10
 
@@ -243,14 +245,27 @@ class Plot3D:
 
     def _plot_all(self):
         if self.eps_actor is None or self.update_epsilon:
-            self.plot_epsilon()
+            eps_data=np.rot90(
+                np.real(
+                    self.sim.get_epsilon_grid(self.xtics, self.ytics, self.ztics, self.frequency)
+                    )
+                ).flatten(order='F')
+            if mp.am_master():
+                self.plot_epsilon(eps_data)
 
-        self.plot_sources()
-        self.plot_monitors()
-        self.plot_boundaries()
+        if mp.am_master():
+            self.plot_sources()
+            self.plot_monitors()
+            self.plot_boundaries()
 
         if self.field_component:
-            self.plot_field_component()
+            if not self.sim._is_initialized:
+                print("initializing sim...")
+                self.sim.init_sim()
+            field_data = self.sim.get_array(vol=self.volume, component=self.field_component)
+
+            if mp.am_master():
+                self.plot_field_component(field_data)
 
     def plot(self, show: bool = False):
         self._plot_all()
@@ -278,64 +293,63 @@ class Plot3D:
         self.field_actor.SetVisibility(state)
 
     def toggle_sources(self, state):
-        for actor in [actor for name, actor in self.mesh_actors.items() if "source-" in name]:
+        for actor in self.source_actors:
             actor.SetVisibility(state)
 
     def toggle_monitors(self, state):
-        for actor in [actor for name, actor in self.mesh_actors.items() if "monitor-" in name]:
+        for actor in self.monitor_actors:
             actor.SetVisibility(state)
 
     def toggle_boundaries(self, state):
-        for actor in [actor for name, actor in self.mesh_actors.items() if "boundary-" in name]:
+        for actor in self.boundary_actors:
             actor.SetVisibility(state)
 
     def increment_checkbox_pos(self):
         self.toggle_y_start = self.toggle_y_start + self.toggle_box_size + (self.toggle_box_size // 10)
 
     def add_toggle_box_text(self, text: str):
-        if text in self.text_actors.keys():
-            print(f"Actor for {text} being recreated!")
-            self.pl.remove_actor(self.text_actors.pop(text))
         self.text_actors[text] = self.pl.add_text(
             text=text,
             position=(self.toggle_text_offset_x, self.toggle_y_start + self.toggle_text_offset_y),
             font_size=self.font_size
         )
 
-    def plot_volume3d(self, volume: Volume, name: str, **plot_parameters):
-        if mp.am_master():
-            if name in self.text_actors.keys():
-                print(f"Actor for {name} being recreated!")
-                self.pl.remove_actor(self.text_actors.pop(name))
-
-            vol = pv.Cube(
-                center=[volume.center.x, volume.center.y, volume.center.z],
-                x_length=volume.size.x, y_length=volume.size.y, z_length=volume.size.z
-            )
-            self.mesh_actors[name] = self.pl.add_mesh(
-                    vol, 
+    def plot_volume3d(self, size: Union[Vector3, tuple], center: Union[Vector3, tuple] = (0, 0, 0), **plot_parameters):
+        return self.pl.add_mesh(
+                    pv.Cube(
+                        center=(center.x, center.y, center.z) if isinstance(center, Vector3) else center,
+                        x_length=size[0],
+                        y_length=size[1],
+                        z_length=size[2]                
+                        ),
                     **filter_dict(plot_parameters, pv.Plotter.add_mesh)
                     )
 
-    def plot_epsilon(self):
+    def plot_epsilon(self, eps_data: np.ndarray):
         # Plot geometry
-        eps_data = np.rot90(
-            np.real(
-                sim.get_epsilon_grid(self.xtics, self.ytics, self.ztics, self.frequency)
-            )
-        ).flatten(order='F')
+        
         if mp.am_master():
-            self.eps_grid["epsilon"] = eps_data
-
             print("Updating epsilon data...")
+
+            self.grid["epsilon"] = eps_data
+
             eps_parameters_all = filter_dict(self.eps_parameters, pv.Plotter.add_mesh)
             eps_parameters_all.update(filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
 
-            self.eps_actor = self.pl.add_mesh_threshold(
-                self.eps_grid.contour() if self.eps_parameters["contour"] else self.eps_grid,
-                name="epsilon",
-                **eps_parameters_all
-            )
+            if self.eps_parameters["contour"]:
+                self.eps_actor = self.pl.add_mesh(
+                    self.grid.contour(scalars="epsilon", compute_normals=True, progress_bar=True),
+                    # self.grid.ex
+                    name="epsilon",
+                    **eps_parameters_all
+                    )
+            else:
+                self.eps_actor = self.pl.add_mesh_threshold(
+                    self.grid,
+                    name="epsilon",
+                    scalars="epsilon",
+                    **eps_parameters_all
+                    )
 
             if "epsilon" not in self.toggle_boxes:
                 self.toggle_boxes["epsilon"] = (
@@ -353,96 +367,91 @@ class Plot3D:
                 self.increment_checkbox_pos()
 
     # Plot fields
-    def plot_field_component(self):
-        if not sim._is_initialized:
-            sim.init_sim()
-
-        field_data = sim.get_array(vol=self.volume, component=self.field_component)
+    def plot_field_component(self, field_data: np.ndarray):
         field_data = self.field_parameters["post_process"](field_data)
 
-        if (sim.dimensions == mp.CYLINDRICAL) or sim.is_cylindrical:
+        if (self.sim.dimensions == mp.CYLINDRICAL) or self.sim.is_cylindrical:
             field_data = np.flipud(field_data)
         else:
             field_data = np.rot90(field_data)
         field_data = field_data.flatten(order='F')
 
-        if mp.am_master():
-            self.field_grid["field"] = field_data
+        self.grid["field"] = field_data
 
-            print("Updating field data...")
+        print("Updating field data...")
 
-            self.field_actor = self.pl.add_mesh(
-                # Add option to draw glyphs
-                self.field_grid.contour(),
-                name="field",
-                **filter_dict(self.field_parameters, pv.Plotter.add_mesh)
-            )
-            if "field" not in self.toggle_boxes:
-                self.toggle_boxes["field"] = (
-                    self.pl.add_checkbox_button_widget(
-                        self.toggle_fields,
-                        size=self.toggle_box_size,
-                        value=True,
-                        position=(self.toggle_x, self.toggle_y_start),
-                        border_size=1,
-                        color_on="y",
-                        color_off="grey",
-                        background_color="grey"
-                    )
+        self.field_actor = self.pl.add_mesh(
+            # Add option to draw glyphs
+            self.grid.contour(scalars="field"),
+            name="field",
+            **filter_dict(self.field_parameters, pv.Plotter.add_mesh)
+        )
+        if "field" not in self.toggle_boxes:
+            self.toggle_boxes["field"] = (
+                self.pl.add_checkbox_button_widget(
+                    self.toggle_fields,
+                    size=self.toggle_box_size,
+                    value=True,
+                    position=(self.toggle_x, self.toggle_y_start),
+                    border_size=1,
+                    color_on="y",
+                    color_off="grey",
+                    background_color="grey"
                 )
-                self.add_toggle_box_text(text="field")
-                self.increment_checkbox_pos()
+            )
+            self.add_toggle_box_text(text="field")
+            self.increment_checkbox_pos()
 
     # Plot sources
     def plot_sources(self):
         # Don't redraw
-        if mp.am_master() and "sources" in self.toggle_boxes.keys():
+        if "sources" in self.toggle_boxes.keys():
             return
 
-        for i, src in enumerate(sim.sources):
-            vol = Volume(center=src.center, size=src.size)
-            self.plot_volume3d(volume=vol, name=f"source-{i}", **self.source_parameters)
+        for src in self.sim.sources:
+            self.source_actors.append(
+                    self.plot_volume3d(center=src.center, size=src.size, **self.source_parameters)
+                    )
 
-        if mp.am_master():
-            self.toggle_boxes["sources"] = (
-                self.pl.add_checkbox_button_widget(
-                    self.toggle_sources,
-                    size=self.toggle_box_size,
-                    value=True,
-                    position=(self.toggle_x, self.toggle_y_start),
-                    border_size=1,
-                    color_on="r",
-                    color_off="grey",
-                    background_color="grey"
-                )
+        self.toggle_boxes["sources"] = (
+            self.pl.add_checkbox_button_widget(
+                self.toggle_sources,
+                size=self.toggle_box_size,
+                value=True,
+                position=(self.toggle_x, self.toggle_y_start),
+                border_size=1,
+                color_on="r",
+                color_off="grey",
+                background_color="grey"
             )
-            self.add_toggle_box_text(text="source")
+        )
+        self.add_toggle_box_text(text="source")
         self.increment_checkbox_pos()
 
     # Plot monitors
     def plot_monitors(self):
-        if mp.am_master() and "monitors" in self.toggle_boxes.keys():
+        if "monitors" in self.toggle_boxes.keys():
             return
 
-        for i, mon in enumerate(sim.dft_objects):
-            for j, reg in enumerate(mon.regions):
-                vol = Volume(center=reg.center, size=reg.size)
-                self.plot_volume3d(volume=vol, name=f"monitor-{i},{j}", **self.monitor_parameters)
+        for mon in self.sim.dft_objects:
+            for reg in mon.regions:
+                self.monitor_actors.append(
+                        self.plot_volume3d(center=reg.center, size=reg.size, **self.monitor_parameters)
+                        )
 
-        if mp.am_master():
-            self.toggle_boxes["monitors"] = (
-                self.pl.add_checkbox_button_widget(
-                    self.toggle_monitors,
-                    size=self.toggle_box_size,
-                    value=True,
-                    position=(self.toggle_x, self.toggle_y_start),
-                    border_size=1,
-                    color_on="b",
-                    color_off="grey",
-                    background_color="grey"
-                )
+        self.toggle_boxes["monitors"] = (
+            self.pl.add_checkbox_button_widget(
+                self.toggle_monitors,
+                size=self.toggle_box_size,
+                value=True,
+                position=(self.toggle_x, self.toggle_y_start),
+                border_size=1,
+                color_on="b",
+                color_off="grey",
+                background_color="grey"
             )
-            self.add_toggle_box_text(text="monitor")
+        )
+        self.add_toggle_box_text(text="monitor")
         self.increment_checkbox_pos()
 
     def plot_boundaries(self):
@@ -451,67 +460,75 @@ class Plot3D:
             return
 
         import itertools
-        for i, boundary in enumerate(sim.boundary_layers):
+        for boundary in self.sim.boundary_layers:
             # boundary on all four sides
             if boundary.direction == mp.ALL and boundary.side == mp.ALL:
-                if sim.dimensions == 1:
+                if self.sim.dimensions == 1:
                     dims = [mp.X]
-                elif sim.dimensions == mp.CYLINDRICAL or sim.is_cylindrical:
+                elif self.sim.dimensions == mp.CYLINDRICAL or self.sim.is_cylindrical:
                     dims = [mp.X, mp.Z]
-                elif sim.dimensions == 2:
+                elif self.sim.dimensions == 2:
                     dims = [mp.X, mp.Y]
-                elif sim.dimensions == 3:
+                elif self.sim.dimensions == 3:
                     dims = [mp.X, mp.Y, mp.Z]
                 else:
                     raise ValueError("Invalid simulation dimensions")
-                for j, permutation in enumerate(itertools.product(dims, [mp.Low, mp.High])):
+                for permutation in itertools.product(dims, [mp.Low, mp.High]):
                     if ((permutation[0] == mp.X) and (permutation[1] == mp.Low)) and (
-                            sim.dimensions == mp.CYLINDRICAL or sim.is_cylindrical
+                            self.sim.dimensions == mp.CYLINDRICAL or self.sim.is_cylindrical
                     ):
                         continue
-                    self.plot_volume3d(
-                        get_boundary_volumes(sim, boundary.thickness, *permutation),
-                        name=f"boundary-all-{i}-{j}",
-                        **self.boundary_parameters
-                    )
+                    vol = get_boundary_volumes(self.sim, boundary.thickness, *permutation)
+                    self.boundary_actors.append(
+                            self.plot_volume3d(
+                                size=vol.size,
+                                center=vol.center,
+                                **self.boundary_parameters
+                                )
+                            )
             elif boundary.side == mp.ALL:
                 # boundary on only two of four sides
-                for name, side in zip(["low", "high"], [mp.Low, mp.High]):
+                for side in [mp.Low, mp.High]:
                     if ((boundary.direction == mp.X) and (side == mp.Low)) and (
-                            sim.dimensions == mp.CYLINDRICAL or sim.is_cylindrical
+                        self.sim.dimensions == mp.CYLINDRICAL or self.sim.is_cylindrical
                     ):
                         continue
-                    self.plot_volume3d(
-                        get_boundary_volumes(sim, boundary.thickness, boundary.direction, side),
-                        name=f"boundary-{name}-{i}",
-                        **self.boundary_parameters
-                    )
+                    vol = get_boundary_volumes(self.sim, boundary.thickness, boundary.direction, side)
+                    self.boundary_actors.append(
+                            self.plot_volume3d(
+                                size=vol.size,
+                                center=vol.center,
+                                **self.boundary_parameters
+                                )
+                        )
             # boundary on just one side
             else:
                 if ((boundary.direction == mp.X) and (boundary.side == mp.Low)) and (
-                        sim.dimensions == mp.CYLINDRICAL or sim.is_cylindrical
+                        self.sim.dimensions == mp.CYLINDRICAL or self.sim.is_cylindrical
                 ):
                     continue
-                self.plot_volume3d(
-                    get_boundary_volumes(sim, boundary.thickness, boundary.direction, boundary.side),
-                    name=f"boundary-single-{i}",
-                    **self.boundary_parameters
-                )
+                vol =  get_boundary_volumes(self.sim, boundary.thickness, boundary.direction, boundary.side)
+                self.boundary_actors.append(
+                        self.plot_volume3d(
+                            size=vol.size,
+                            center=vol.center,
+                            **self.boundary_parameters
+                            )
+                        )
 
-        if mp.am_master():
-            self.toggle_boxes["boundaries"] = (
-                self.pl.add_checkbox_button_widget(
-                    self.toggle_boundaries,
-                    size=self.toggle_box_size,
-                    value=True,
-                    position=(self.toggle_x, self.toggle_y_start),
-                    border_size=1,
-                    color_on="g",
-                    color_off="grey",
-                    background_color="grey"
-                )
+        self.toggle_boxes["boundaries"] = (
+            self.pl.add_checkbox_button_widget(
+                self.toggle_boundaries,
+                size=self.toggle_box_size,
+                value=True,
+                position=(self.toggle_x, self.toggle_y_start),
+                border_size=1,
+                color_on="g",
+                color_off="grey",
+                background_color="grey"
             )
-            self.add_toggle_box_text(text="boundaries")
+        )
+        self.add_toggle_box_text(text="boundaries")
         self.increment_checkbox_pos()
        
 # import mpi4py
@@ -653,10 +670,9 @@ if __name__ == "__main__":
     #     pl.show()
     # anim = Animate3D(
     #     field_component=mp.Ey,
-    #     field_parameters={"post_process": lambda x: np.abs(x)**2},
-    #     # plot_boundaries_flag=False
+    #         #     # plot_boundaries_flag=False
     # )
-    #
-    sim.run(mp.at_every(0.15, plotter), until=1)
+   
+    # sim.run(mp.at_every(0.15, plotter), until=1)
 
     plotter.plot(show=True)

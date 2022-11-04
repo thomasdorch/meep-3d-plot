@@ -1,7 +1,7 @@
-from .plotting import Animate3D, plot3d
+from .plotting import Animate3D, Plot3D
 
 __all__ = [
         "Animate3D",
-        "plot3d"
+        "Plot3D"
         ]
 
