@@ -204,7 +204,7 @@ class Plot3D:
             *get_3d_ticks(
                 size=self.sim_domain.size, center=self.sim_domain.center, resolution=sim.resolution
             )
-        )
+        ) if mp.am_master() else None
 
         self.mesh_actor = None
         self.field_actor = None
@@ -223,6 +223,8 @@ class Plot3D:
         self.toggle_boxes = {}
         self.text_actors = {}
 
+        self.initialized = False
+
         # Needed for step functions
         self.__code__ = namedtuple("gna_hack", ["co_argcount"])
         self.__code__.co_argcount = 2
@@ -231,18 +233,8 @@ class Plot3D:
         if self.show_mesh and mp.am_master():
             self.plot_mesh()
 
-        if self.eps_actor is None or self.update_epsilon:
-            eps_data = np.real(
-                self.sim.get_epsilon_grid(
-                    self.grid.x,
-                    self.grid.y,
-                    self.grid.z,
-                    self.eps_parameters["frequency"] or 0
-                    )
-                ).ravel(order="F")
-
-            if mp.am_master():
-                self.plot_epsilon(eps_data)
+        if (not self.initialized) or self.update_epsilon:
+            self.plot_epsilon()
 
         if mp.am_master():
             self.plot_sources()
@@ -257,6 +249,7 @@ class Plot3D:
             field_data = self.sim.get_array(vol=self.sim_domain, component=self.field_component)
             field_data = self.field_parameters["post_process"](field_data)
 
+            # TODO: Check if this is needed
             if (self.sim.dimensions == mp.CYLINDRICAL) or self.sim.is_cylindrical:
                 field_data = np.flipud(field_data)
 
@@ -351,36 +344,116 @@ class Plot3D:
         self.mesh_actor = self.pl.add_mesh(self.grid, show_edges=True, style="wireframe", smooth_shading=True)
         self.make_toggle_box("mesh", self.toggle_mesh, color_on="white")
 
-    def plot_epsilon(self, eps_data: np.ndarray):
+    def plot_epsilon(self):
         # Plot geometry
         print("Updating epsilon data...")
-
-        self.grid["epsilon"] = eps_data
 
         eps_parameters = filter_dict(self.eps_parameters, pv.Plotter.add_mesh)
 
         plot_type = self.eps_parameters["type"]
-        if plot_type == "contour":
-            self.eps_actor = self.pl.add_mesh(
-                self.grid.contour(scalars="epsilon", compute_normals=True, progress_bar=True),
-                name="epsilon",
-                **eps_parameters
-                )
-        elif plot_type == "blocks":
-            eps_parameters = dict(**eps_parameters, **filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
 
-            self.eps_actor = self.pl.add_mesh(
-                self.grid.threshold(
-                    scalars="epsilon",
-                    value=self.sim.default_material.epsilon(0)[0, 0] + 0.1
-                ).split_bodies(label=True),
-                name="epsilon",
-                smooth_shading=True,
-                **eps_parameters
+        if plot_type != "geometry":
+            # Only get this if we need it
+            self.grid["epsilon"] = np.real(
+                self.sim.get_epsilon_grid(
+                    self.grid.x,
+                    self.grid.y,
+                    self.grid.z,
+                    self.eps_parameters["frequency"] or 0
                 )
+            ).ravel(order="F")
 
-        if "epsilon" not in self.toggle_boxes:
-            self.make_toggle_box("epsilon", self.toggle_epsilon, color_on="black")
+        if mp.am_master():
+            if plot_type == "contour":
+                self.eps_actor = self.pl.add_mesh(
+                    self.grid.contour(scalars="epsilon", compute_normals=True, progress_bar=True),
+                    name="epsilon",
+                    **eps_parameters
+                )
+            elif plot_type == "bodies":
+                eps_parameters = dict(**eps_parameters,
+                                      **filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
+                self.eps_actor = self.pl.add_mesh(
+                    self.grid.threshold(
+                        scalars="epsilon",
+                        value=self.sim.default_material.epsilon(0)[0, 0] + 0.1
+                    ).split_bodies(label=True),
+                    name="epsilon",
+                    smooth_shading=True,
+                    **eps_parameters
+                )
+            if plot_type == "geometry":
+                if self.update_epsilon:
+                    print("WARNING: Using update_epsilon with plot_type == 'geometry' will have no effect, as the "
+                          "geometry is defined only by GeometricObjects.")
+
+                box = box_vertices(self.sim_domain.center, self.sim_domain.size)
+
+                mb = pv.MultiBlock()
+                for i, obj in enumerate(self.sim.geometry):
+                    if isinstance(obj, mp.Block):
+                        mb.append(
+                            pv.Cube(
+                                bounds=[
+                                    max([extent_pt, obj_pt]) if i % 2 == 0 else min([extent_pt, obj_pt])
+                                    for i, (extent_pt, obj_pt) in enumerate(zip(box, box_vertices(obj.center, obj.size)))
+                                ]
+                            ),
+                            name=str(i)
+                        )
+                    elif isinstance(obj, mp.Sphere):
+                        mb.append(
+                            pv.Sphere(
+                                radius=obj.radius,
+                                center=tuple(obj.center)
+                            ).clip_box(box, invert=False),
+                            name=str(i)
+                        )
+                    elif isinstance(obj, mp.Ellipsoid):
+                        mb.append(
+                            pv.ParametricEllipsoid(
+                                *tuple(obj.size),
+                                center=tuple(obj.center)
+                            ).clip_box(box, invert=False),
+                            name=str(i)
+                        )
+                    elif isinstance(obj, mp.Cylinder):
+                        mb.append(
+                            pv.Cylinder(
+                                center=tuple(obj.center),
+                                height=obj.height,
+                                direction=tuple(obj.axis)
+                            ).clip_box(box, invert=False),
+                            name=str(i)
+                        )
+                    elif isinstance(obj, mp.Cone):
+                        mb.append(
+                            pv.Cone(
+                                center=tuple(obj.center),
+                                direction=tuple(obj.axis),
+                                height=obj.height,
+                                radius=obj.radius
+                            ).clip_box(box, invert=False),
+                            name=str(i)
+                        )
+                    elif isinstance(obj, mp.Prism):
+                        raise NotImplemented("Prisms are not implemented yet!")
+                    elif isinstance(obj, mp.Wedge):
+                        raise NotImplemented("Wedges are not implemented yet!")
+                    elif isinstance(obj, mp.GeometricObject):
+                        raise LookupError("Unrecognized GeometricObject!")
+                    else:
+                        raise KeyError("Unsupported geometry type!")
+
+                self.eps_actor = self.pl.add_mesh(
+                    mb,
+                    name="epsilon",
+                    smooth_shading=True,
+                    **eps_parameters
+                )
+            if "epsilon" not in self.toggle_boxes:
+                self.make_toggle_box("epsilon", self.toggle_epsilon, color_on="black")
+        self.initialized = True
 
     # Plot fields
     def plot_field_component(self, field_data: np.ndarray):
@@ -625,19 +698,19 @@ if __name__ == "__main__":
             mp.Block(size=mp.Vector3(10, 0.5, 0.22), center=mp.Vector3(), material=mp.Medium(index=2)),
             mp.Block(size=mp.Vector3(10, 10, 2), center=mp.Vector3(0, 0, -1.5), material=mp.Medium(index=3.47)),
         ],
-        cell_size=mp.Vector3(5, 5, 5),
+        cell_size=mp.Vector3(25, 25, 25),
         resolution=30,
-        sources=[src],
+        # sources=[src],
         default_material=mp.Medium(index=1.0),
         boundary_layers=[mp.PML(thickness=1.0, direction=mp.ALL)]
     )
-    sim.add_flux(f, 0.1, 10, mon)
+    # sim.add_flux(f, 0.1, 10, mon)
 
     plotter = Plot3D(
         sim,
         # field_component=mp.Ey,
         # show_mesh=True,
-        eps_parameters={"type": "blocks"},
+        eps_parameters={"type": "geometry"},
         field_parameters={
             "type": "contour",
             "post_process": lambda x: np.abs(x) ** 2
