@@ -449,6 +449,7 @@ class Plot3D:
                     mb,
                     name="epsilon",
                     smooth_shading=True,
+                    multi_colors=True,
                     **eps_parameters
                 )
             if "epsilon" not in self.toggle_boxes:
