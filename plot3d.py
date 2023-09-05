@@ -1,11 +1,8 @@
-from types import resolve_bases
 import meep as mp
 from meep import Vector3, Volume
-from meep.simulation import re
 from meep.visualization import box_vertices, filter_dict
 from typing import Optional, Union, Callable
 from collections import namedtuple
-from functools import partial
 import pyvista as pv
 
 import numpy as np
@@ -68,7 +65,7 @@ def get_boundary_volumes(sim: mp.Simulation, boundary_thickness: float, directio
 
 default_eps_parameters_3d = {
     "cmap": "binary",
-    "opacity": 0.85,
+    "opacity": 0.7,
     "type": "blocks",
     "line_width": 1,
     "show_edges": False,
@@ -163,28 +160,16 @@ class Plot3D:
             source_parameters: Optional[dict] = None,
             monitor_parameters: Optional[dict] = None,
             field_parameters: Optional[dict] = None,
+            plot_boundaries_flag: bool = True,
+            plot_sources_flag: bool = True,
+            plot_monitors_flag: bool = True,
+            clip_volume: mp.Volume = None,
             camera_position: Union[str, tuple] = "xz",
             notebook: bool = False,
             **plotter_kwargs
     ):
         self.close_when_finished = close_when_finished
         self.pl = plotter
-
-        if self.pl is None and mp.am_master():
-            self.pl = pv.Plotter(
-                off_screen=False,
-                line_smoothing=True,
-                notebook=notebook,
-                **filter_dict(plotter_kwargs, pv.Plotter.__init__)
-            )
-
-            self.pl.add_axes()
-            self.pl.show_bounds(
-                grid='front',
-                location='outer',
-                all_edges=True,
-            )
-            self.pl.camera_position = camera_position
 
         self.show_mesh = show_mesh
         self.update_epsilon = update_epsilon
@@ -196,15 +181,27 @@ class Plot3D:
         self.boundary_parameters = clean_dict(boundary_parameters, default_boundary_parameters_3d)
         self.field_parameters = clean_dict(field_parameters, default_field_parameters_3d)
 
+        self.plot_boundaries_flag = plot_boundaries_flag
+        self.plot_sources_flag = plot_sources_flag
+        self.plot_monitors_flag = plot_monitors_flag
+
         self.sim = sim
 
-        self.sim_domain = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
+        self.volume = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
 
-        self.grid = pv.RectilinearGrid(
-            *get_3d_ticks(
-                size=self.sim_domain.size, center=self.sim_domain.center, resolution=sim.resolution
+        if clip_volume is None:
+            clip_volume = self.volume
+
+        self.clip_box = box_vertices(
+            clip_volume.center,
+            clip_volume.size
+        )
+
+        self.grid_ticks = get_3d_ticks(
+                size=self.volume.size, center=self.volume.center, resolution=sim.resolution
             )
-        ) if mp.am_master() else None
+
+        self.grid = pv.RectilinearGrid(*self.grid_ticks) if mp.am_master() else None
 
         self.mesh_actor = None
         self.field_actor = None
@@ -223,6 +220,22 @@ class Plot3D:
         self.toggle_boxes = {}
         self.text_actors = {}
 
+        if self.pl is None and mp.am_master():
+            self.pl = pv.Plotter(
+                off_screen=False,
+                line_smoothing=True,
+                notebook=notebook,
+                **filter_dict(plotter_kwargs, pv.Plotter.__init__)
+            )
+            self.pl.add_axes()
+            self.pl.show_bounds(
+                bounds=self.clip_box,
+                grid='front',
+                location='outer',
+                # all_edges=True,
+            )
+            # self.pl.camera_position = camera_position
+
         self.initialized = False
 
         # Needed for step functions
@@ -230,33 +243,28 @@ class Plot3D:
         self.__code__.co_argcount = 2
 
     def _plot_all(self):
+        print("Called plot_all")
         if self.show_mesh and mp.am_master():
             self.plot_mesh()
-
+        
+        print("Plotting epsilon")
         if (not self.initialized) or self.update_epsilon:
             self.plot_epsilon()
 
-        if mp.am_master():
+        if self.plot_sources_flag:
             self.plot_sources()
+
+        if self.plot_monitors_flag:
             self.plot_monitors()
+
+        if self.plot_boundaries_flag:
             self.plot_boundaries()
 
-        if self.field_component:
+        if self.field_component is not None:
             if not self.sim._is_initialized:
                 print("initializing sim...")
                 self.sim.init_sim()
-
-            field_data = self.sim.get_array(vol=self.sim_domain, component=self.field_component)
-            field_data = self.field_parameters["post_process"](field_data)
-
-            # TODO: Check if this is needed
-            if (self.sim.dimensions == mp.CYLINDRICAL) or self.sim.is_cylindrical:
-                field_data = np.flipud(field_data)
-
-            field_data = field_data.ravel(order="F")
-
-            if mp.am_master():
-                self.plot_field_component(field_data)
+            self.plot_field_component() 
 
     def plot(self, show: bool = False):
         self._plot_all()
@@ -322,7 +330,7 @@ class Plot3D:
                         x_length=size[0],
                         y_length=size[1],
                         z_length=size[2]                
-                        ),
+                        ).clip_box(self.clip_box, invert=False),
                     **filter_dict(plot_parameters, pv.Plotter.add_mesh)
                     )
 
@@ -341,7 +349,16 @@ class Plot3D:
     def plot_mesh(self):
         if self.mesh_actor is not None:
             return
-        self.mesh_actor = self.pl.add_mesh(self.grid, show_edges=True, style="wireframe", smooth_shading=True)
+        self.mesh_actor = self.pl.add_mesh(
+                self.grid.clip_box(self.clip_box, invert=False),
+                show_edges=True, 
+                # style="wireframe",
+                opacity=0.1,
+                smooth_shading=True,
+                line_width=1,
+                render_lines_as_tubes=True,
+                backface_culling=True
+                )
         self.make_toggle_box("mesh", self.toggle_mesh, color_on="white")
 
     def plot_epsilon(self):
@@ -352,43 +369,12 @@ class Plot3D:
 
         plot_type = self.eps_parameters["type"]
 
-        if plot_type != "geometry":
-            # Only get this if we need it
-            self.grid["epsilon"] = np.real(
-                self.sim.get_epsilon_grid(
-                    self.grid.x,
-                    self.grid.y,
-                    self.grid.z,
-                    self.eps_parameters["frequency"] or 0
-                )
-            ).ravel(order="F")
+        if plot_type == "geometry":
 
-        if mp.am_master():
-            if plot_type == "contour":
-                self.eps_actor = self.pl.add_mesh(
-                    self.grid.contour(scalars="epsilon", compute_normals=True, progress_bar=True),
-                    name="epsilon",
-                    **eps_parameters
-                )
-            elif plot_type == "bodies":
-                eps_parameters = dict(**eps_parameters,
-                                      **filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
-                self.eps_actor = self.pl.add_mesh(
-                    self.grid.threshold(
-                        scalars="epsilon",
-                        value=self.sim.default_material.epsilon(0)[0, 0] + 0.1
-                    ).split_bodies(label=True),
-                    name="epsilon",
-                    smooth_shading=True,
-                    **eps_parameters
-                )
-            if plot_type == "geometry":
-                if self.update_epsilon:
+            if self.update_epsilon:
                     print("WARNING: Using update_epsilon with plot_type == 'geometry' will have no effect, as the "
                           "geometry is defined only by GeometricObjects.")
-
-                box = box_vertices(self.sim_domain.center, self.sim_domain.size)
-
+            if mp.am_master():
                 mb = pv.MultiBlock()
                 for i, obj in enumerate(self.sim.geometry):
                     if isinstance(obj, mp.Block):
@@ -396,7 +382,7 @@ class Plot3D:
                             pv.Cube(
                                 bounds=[
                                     max([extent_pt, obj_pt]) if i % 2 == 0 else min([extent_pt, obj_pt])
-                                    for i, (extent_pt, obj_pt) in enumerate(zip(box, box_vertices(obj.center, obj.size)))
+                                    for i, (extent_pt, obj_pt) in enumerate(zip(self.clip_box, box_vertices(obj.center, obj.size)))
                                 ]
                             ),
                             name=str(i)
@@ -406,7 +392,7 @@ class Plot3D:
                             pv.Sphere(
                                 radius=obj.radius,
                                 center=tuple(obj.center)
-                            ).clip_box(box, invert=False),
+                            ),
                             name=str(i)
                         )
                     elif isinstance(obj, mp.Ellipsoid):
@@ -414,16 +400,17 @@ class Plot3D:
                             pv.ParametricEllipsoid(
                                 *tuple(obj.size),
                                 center=tuple(obj.center)
-                            ).clip_box(box, invert=False),
+                            ),
                             name=str(i)
                         )
                     elif isinstance(obj, mp.Cylinder):
                         mb.append(
                             pv.Cylinder(
+                                radius=obj.radius,
                                 center=tuple(obj.center),
                                 height=obj.height,
                                 direction=tuple(obj.axis)
-                            ).clip_box(box, invert=False),
+                            ),
                             name=str(i)
                         )
                     elif isinstance(obj, mp.Cone):
@@ -433,7 +420,7 @@ class Plot3D:
                                 direction=tuple(obj.axis),
                                 height=obj.height,
                                 radius=obj.radius
-                            ).clip_box(box, invert=False),
+                            ),
                             name=str(i)
                         )
                     elif isinstance(obj, mp.Prism):
@@ -446,53 +433,92 @@ class Plot3D:
                         raise KeyError("Unsupported geometry type!")
 
                 self.eps_actor = self.pl.add_mesh(
-                    mb,
+                    mb.clip_box(self.clip_box, invert=False),
                     name="epsilon",
                     smooth_shading=True,
-                    multi_colors=True,
                     **eps_parameters
                 )
-            if "epsilon" not in self.toggle_boxes:
-                self.make_toggle_box("epsilon", self.toggle_epsilon, color_on="black")
+        else:
+            # Only get this if we need it
+            eps_data = np.real(
+                self.sim.get_epsilon_grid(
+                    self.grid_ticks[0],
+                    self.grid_ticks[1],
+                    self.grid_ticks[2],
+                    self.eps_parameters["frequency"] or 0
+                )
+            )
+            if mp.am_master():
+                self.grid["epsilon"] = eps_data.flatten(order="F")
+                if plot_type == "contour":
+                    self.eps_actor = self.pl.add_mesh(
+                        self.grid.contour(scalars="epsilon", progress_bar=True).clip_box(self.clip_box, invert=False),
+                        name="epsilon",
+                        **eps_parameters
+                    )
+                elif plot_type == "bodies":
+                    eps_parameters = dict(**eps_parameters,
+                                          **filter_dict(self.eps_parameters, pv.Plotter.add_mesh_threshold))
+                    self.eps_actor = self.pl.add_mesh(
+                        self.grid.threshold(
+                            scalars="epsilon",
+                            value=self.sim.default_material.epsilon(0)[0, 0] + 0.1
+                        ).split_bodies(label=True).clip_box(self.clip_box, invert=False),
+                        name="epsilon",
+                        smooth_shading=True,
+                        **eps_parameters
+                    )
+            
+        if mp.am_master() and "epsilon" not in self.toggle_boxes:
+            self.make_toggle_box("epsilon", self.toggle_epsilon, color_on="black")
         self.initialized = True
 
     # Plot fields
-    def plot_field_component(self, field_data: np.ndarray):
+    def plot_field_component(self):
         print("Updating field data...")
+        field_data = self.sim.get_array(vol=self.volume, component=self.field_component)
+        field_data = self.field_parameters["post_process"](field_data)
 
-        self.grid["field"] = field_data
+        # TODO: Check if this is needed
+        if (self.sim.dimensions == mp.CYLINDRICAL) or self.sim.is_cylindrical:
+            field_data = np.flipud(field_data)
 
-        plot_type = self.field_parameters["type"]
-        if plot_type == "contour":
-            self.field_actor = self.pl.add_mesh(
-                # Add option to draw glyphs
-                self.grid.contour(scalars="field"),
-                name="field",
-                smooth_shading=True,
-                **filter_dict(self.field_parameters, pv.Plotter.add_mesh)
-            )
-        elif plot_type == "glyph":
-            max_val = np.max(self.grid["field"])
-            # mask = (self.grid["field"] / max_val) < 0.05
-            # self.grid["field"][mask] = 0
+        if mp.am_master():
+            self.grid["field"] = field_data.flatten(order="F")
+            plot_type = self.field_parameters["type"]
+            if plot_type == "contour":
+                self.field_actor = self.pl.add_mesh(
+                    # Add option to draw glyphs
+                    self.grid.contour(
+                        scalars="field",
+                        isosurfaces=15,
+                        compute_normals=True,
+                        compute_gradients=True
+                    ).clip_box(self.clip_box, invert=False),
+                    name="field",
+                )
+            elif plot_type == "glyph":
+                max_val = np.max(self.grid["field"])
+                # mask = (self.grid["field"] / max_val) < 0.05
+                # self.grid["field"][mask] = 0
 
-            self.field_actor = self.pl.add_mesh(
-                # Add option to draw glyphs
-                self.grid.glyph(
-                    scale="field",
-                    factor=1/max_val * 0.1,
-                    progress_bar=True
-                ),
-                name="field",
-                **filter_dict(self.field_parameters, pv.Plotter.add_mesh)
-            )
-        if "field" not in self.toggle_boxes:
-            self.make_toggle_box("field", self.toggle_fields, color_on="yellow")
+                self.field_actor = self.pl.add_mesh(
+                    # Add option to draw glyphs
+                    self.grid.glyph(
+                        scale="field",
+                        factor=1/max_val * 0.1,
+                        progress_bar=True
+                    ).clip_box(self.clip_box, invert=False),
+                    name="field",
+                    **filter_dict(self.field_parameters, pv.Plotter.add_mesh)
+                )
+            if "field" not in self.toggle_boxes:
+                self.make_toggle_box("field", self.toggle_fields, color_on="yellow")
 
     # Plot sources
     def plot_sources(self):
         # Don't redraw
-        if "sources" in self.toggle_boxes.keys():
+        if (not mp.am_master()) or "sources" in self.toggle_boxes.keys() or (self.sim.sources == []):
             return
 
         for src in self.sim.sources:
@@ -504,7 +530,7 @@ class Plot3D:
 
     # Plot monitors
     def plot_monitors(self):
-        if "monitors" in self.toggle_boxes.keys():
+        if (not mp.am_master()) or "monitors" in self.toggle_boxes.keys() or (self.sim.dft_objects == []):
             return
 
         for mon in self.sim.dft_objects:
@@ -517,7 +543,7 @@ class Plot3D:
 
     def plot_boundaries(self):
         # Don't redraw boundaries
-        if "boundaries" in self.toggle_boxes.keys():
+        if (not mp.am_master()) or "boundaries" in self.toggle_boxes.keys() or (self.sim.boundary_layers == []):
             return
 
         import itertools
@@ -695,29 +721,29 @@ if __name__ == "__main__":
     )
     sim = mp.Simulation(
         geometry=[
-            mp.Block(size=mp.Vector3(10, 10, 1), center=mp.Vector3(0, 0, 1.5), material=mp.Medium(index=1.44)),
-            mp.Block(size=mp.Vector3(10, 0.5, 0.22), center=mp.Vector3(), material=mp.Medium(index=2)),
-            mp.Block(size=mp.Vector3(10, 10, 2), center=mp.Vector3(0, 0, -1.5), material=mp.Medium(index=3.47)),
+            # mp.Block(size=mp.Vector3(10, 10, 1), center=mp.Vector3(0, 0, 1.5), material=mp.Medium(index=1.44)),
+            mp.Block(size=mp.Vector3(10, 0.5, 0.22), center=mp.Vector3(), material=mp.Medium(index=3.47)),
+            # mp.Block(size=mp.Vector3(10, 10, 2), center=mp.Vector3(0, 0, -1.5), material=mp.Medium(index=3.47)),
         ],
-        cell_size=mp.Vector3(25, 25, 25),
+        cell_size=mp.Vector3(10, 10, 4),
         resolution=30,
-        # sources=[src],
-        default_material=mp.Medium(index=1.0),
+        sources=[src],
+        default_material=mp.Medium(index=1.4),
         boundary_layers=[mp.PML(thickness=1.0, direction=mp.ALL)]
     )
     # sim.add_flux(f, 0.1, 10, mon)
 
     plotter = Plot3D(
         sim,
-        # field_component=mp.Ey,
-        # show_mesh=True,
+        field_component=mp.Ey,
+        show_mesh=True,
         eps_parameters={"type": "geometry"},
         field_parameters={
             "type": "contour",
             "post_process": lambda x: np.abs(x) ** 2
         },
     )
-
-    # sim.run(mp.at_every(0.15, plotter), until=1)
+    # plotter.plot(show=True)
+    sim.run(mp.at_every(0.15, plotter), until=1)
 
     plotter.plot(show=True)
